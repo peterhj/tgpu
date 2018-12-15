@@ -171,6 +171,17 @@ impl<E> TGpuEventPool<E> {
   }
 }
 
+pub struct TGpuStreamRef<'a, E=DefaultEpoch> {
+  this: &'a mut TGpuStream<E>,
+}
+
+impl<'a, E> TGpuStreamRef<'a, E> {
+  #[cfg(feature = "gpu")]
+  pub fn cuda_stream(&mut self) -> &mut CudaStream {
+    &mut self.this.rstream
+  }
+}
+
 pub struct TGpuStream<E=DefaultEpoch> {
   dev:      i32,
   t:        LamportTime<E>,
@@ -178,13 +189,6 @@ pub struct TGpuStream<E=DefaultEpoch> {
   events:   TGpuEventPool<E>,
   #[cfg(feature = "gpu")]
   rstream:  CudaStream,
-}
-
-impl<E> TGpuStream<E> {
-  #[cfg(feature = "gpu")]
-  pub fn cuda_stream(&mut self) -> &mut CudaStream {
-    &mut self.rstream
-  }
 }
 
 impl<E: Ord> TGpuStream<E> {
@@ -198,11 +202,15 @@ impl<E: Ord> TGpuStream<E> {
 
 impl<E: Ord + Clone> TGpuStream<E> {
   pub fn run<F, V>(&mut self, fun: F) -> TGpuThunk<V, E>
-  where F: FnOnce(&mut V, &mut TGpuStream<E>) + 'static, V: Default {
+  where F: FnOnce(&mut V, TGpuStreamRef<E>) + 'static, V: Default {
+    self.wrap_run(V::default(), fun)
+  }
+
+  pub fn wrap_run<F, V>(&mut self, mut val: V, fun: F) -> TGpuThunk<V, E>
+  where F: FnOnce(&mut V, TGpuStreamRef<E>) + 'static {
     let mut ev = self.events.make();
-    let mut val = V::default();
     self.t = self.fresh_time();
-    (fun)(&mut val, self);
+    (fun)(&mut val, TGpuStreamRef{this: self});
     ev.post(self.t.clone(), self);
     TGpuThunk{
       dev:  self.dev,
@@ -254,15 +262,15 @@ pub struct TGpuThunk<V=(), E=DefaultEpoch> {
 }
 
 impl<V, E: Ord + Clone> TGpuThunk<V, E> {
-  pub fn wait(mut self, stream: &mut TGpuStream<E>) -> TGpuThunkRef<V, E> {
-    match self.t.causal_cmp(&stream.t) {
+  pub fn wait(mut self, stream: TGpuStreamRef<E>) -> TGpuThunkRef<V, E> {
+    match self.t.causal_cmp(&stream.this.t) {
       PCausalOrdering::Equal |
       PCausalOrdering::Before => {}
       PCausalOrdering::After => {
         panic!("causal violation");
       }
       PCausalOrdering::Concurrent => {
-        stream.maybe_wait_for(&mut self.ev);
+        stream.this.maybe_wait_for(&mut self.ev);
       }
     }
     TGpuThunkRef{
