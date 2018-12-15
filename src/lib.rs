@@ -3,17 +3,18 @@
 #![feature(pin)]
 #![feature(specialization)]
 
-//extern crate cudart;
+#[cfg(feature = "gpu")]
+extern crate cudart;
 #[macro_use] extern crate lazy_static;
-extern crate parking_lot;
+//extern crate parking_lot;
 
-//use cudart::{CudaStream, CudaEvent};
-use parking_lot::{Mutex, RwLock, MappedRwLockReadGuard, MappedRwLockWriteGuard};
+#[cfg(feature = "gpu")]
+use cudart::{CudaStream, CudaEvent};
+//use parking_lot::{Mutex, RwLock, MappedRwLockReadGuard, MappedRwLockWriteGuard};
 
 use std::cmp::{Ordering, max};
 use std::collections::{HashMap};
-use std::ops::{Deref};
-use std::sync::{Arc};
+//use std::sync::{Arc};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 pub mod ctx;
@@ -95,7 +96,7 @@ pub struct LamportTime<E=DefaultEpoch> {
 }
 
 impl<E: Ord> PCausalOrd for LamportTime<E> {
-  default fn maybe_advance(&mut self, other: &LamportTime<E>) {
+  default fn maybe_advance(&mut self, _other: &LamportTime<E>) {
     unimplemented!();
   }
 
@@ -114,17 +115,17 @@ impl<E: Ord> PCausalOrd for LamportTime<E> {
 
 impl PCausalOrd for LamportTime<DefaultEpoch> {
   fn maybe_advance(&mut self, other: &LamportTime<DefaultEpoch>) {
-    self.tt.epoch = max(self.tt.epoch, other.tt.epoch + 1);
+    self.tt.epoch = max(self.tt.epoch, other.tt.next().epoch);
   }
 }
 
-// TODO
 #[derive(Clone)]
 pub struct TGpuEvent<E=DefaultEpoch> {
   dev:      i32,
   uid:      Uid,
   t:        Option<LamportTime<E>>,
-  //event:    CudaEvent,
+  #[cfg(feature = "gpu")]
+  revent:   CudaEvent,
 }
 
 impl<E: Ord + Clone> TGpuEvent<E> {
@@ -135,24 +136,27 @@ impl<E: Ord + Clone> TGpuEvent<E> {
     }
   }
 
-  pub fn post(&mut self, new_t: LamportTime<E>, tstream: &mut TGpuStream<E>) {
-    assert_eq!(self.uid, tstream.uid, "bug");
+  pub fn post(&mut self, new_t: LamportTime<E>, stream: &mut TGpuStream<E>) {
+    assert_eq!(self.uid, new_t.uid, "bug");
+    assert_eq!(self.uid, stream.uid, "bug");
     match self.t.take() {
       None => {}
       Some(_) => {
         panic!("bug: double post");
       }
     }
-    /*match self.event.record(tstream.cuda_stream()) {
-      // TODO
-    }*/
+    #[cfg(feature = "gpu")]
+    match self.revent.record(&mut stream.rstream) {
+      Err(e) => panic!("record failed: {:?} ({})", e, e.get_string()),
+      Ok(_) => {}
+    }
     self.t = Some(new_t.clone());
   }
 }
 
 pub struct TGpuEventPool<E=DefaultEpoch> {
   _dummy:   E,
-  //free:     VecDeque<CudaEvent>,
+  //rfree:    VecDeque<CudaEvent>,
 }
 
 impl<E> TGpuEventPool<E> {
@@ -168,13 +172,15 @@ pub struct TGpuStream<E=DefaultEpoch> {
   t:        LamportTime<E>,
   horizons: HashMap<Uid, LamportTime<E>>,
   events:   TGpuEventPool<E>,
-  //stream:   CudaStream,
+  #[cfg(feature = "gpu")]
+  rstream:  CudaStream,
 }
 
 impl<E> TGpuStream<E> {
-  /*pub fn cuda_stream(&mut self) -> &mut CudaStream {
-    &mut self.stream
-  }*/
+  #[cfg(feature = "gpu")]
+  pub fn cuda_stream(&mut self) -> &mut CudaStream {
+    &mut self.rstream
+  }
 }
 
 impl<E: Ord> TGpuStream<E> {
@@ -189,7 +195,6 @@ impl<E: Ord> TGpuStream<E> {
 impl<E: Ord + Clone> TGpuStream<E> {
   pub fn run<F, V>(&mut self, fun: F) -> TGpuThunk<V, E>
   where F: FnOnce(&mut V, &mut TGpuStream<E>) + 'static, V: Default {
-    // TODO
     let mut ev = self.events.make();
     let mut val = V::default();
     self.t = self.fresh_time();
@@ -205,10 +210,10 @@ impl<E: Ord + Clone> TGpuStream<E> {
   }
 
   fn maybe_wait_for(&mut self, ev: &mut TGpuEvent<E>) {
-    let et = ev.time();
-    let advance = match self.horizons.get(&ev.uid).map(|t| t.clone()) {
+    let t = ev.time();
+    let advance = match self.horizons.get(&t.uid) {
       None => true,
-      Some(ht) => match ht.causal_cmp(&et) {
+      Some(ht) => match ht.causal_cmp(&t) {
         PCausalOrdering::Before => {
           true
         }
@@ -222,13 +227,13 @@ impl<E: Ord + Clone> TGpuStream<E> {
       },
     };
     if advance {
-      // TODO
-      /*match self.stream.wait_event(&mut ev.event) {
+      #[cfg(feature = "gpu")]
+      match self.rstream.wait_event(&mut ev.revent) {
         Err(e) => panic!("wait_event failed: {:?} ({})", e, e.get_string()),
         Ok(_) => {}
-      }*/
-      self.t.maybe_advance(&et);
-      self.horizons.insert(ev.uid.clone(), et);
+      }
+      self.t.maybe_advance(&t);
+      self.horizons.insert(t.uid.clone(), t);
     }
   }
 }
@@ -244,15 +249,15 @@ pub struct TGpuThunk<V=(), E=DefaultEpoch> {
 }
 
 impl<V, E: Ord + Clone> TGpuThunk<V, E> {
-  pub fn wait(mut self, tstream: &mut TGpuStream<E>) -> TGpuThunkRef<V, E> {
-    match self.t.causal_cmp(&tstream.t) {
+  pub fn wait(mut self, stream: &mut TGpuStream<E>) -> TGpuThunkRef<V, E> {
+    match self.t.causal_cmp(&stream.t) {
       PCausalOrdering::Equal |
       PCausalOrdering::Before => {}
       PCausalOrdering::After => {
         panic!("causal violation");
       }
       PCausalOrdering::Concurrent => {
-        tstream.maybe_wait_for(&mut self.ev);
+        stream.maybe_wait_for(&mut self.ev);
       }
     }
     TGpuThunkRef{
