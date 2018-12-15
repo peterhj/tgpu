@@ -6,15 +6,18 @@
 #[cfg(feature = "gpu")]
 extern crate cudart;
 #[macro_use] extern crate lazy_static;
-//extern crate parking_lot;
+#[cfg(feature = "gpu")]
+extern crate parking_lot;
 
 #[cfg(feature = "gpu")]
 use cudart::{CudaStream, CudaEvent};
-//use parking_lot::{Mutex, RwLock, MappedRwLockReadGuard, MappedRwLockWriteGuard};
+#[cfg(feature = "gpu")]
+use parking_lot::{Mutex};
 
 use std::cmp::{Ordering, max};
 use std::collections::{HashMap};
-//use std::sync::{Arc};
+#[cfg(feature = "gpu")]
+use std::sync::{Arc};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 pub mod ctx;
@@ -125,7 +128,7 @@ pub struct TGpuEvent<E=DefaultEpoch> {
   uid:      Uid,
   t:        Option<LamportTime<E>>,
   #[cfg(feature = "gpu")]
-  revent:   CudaEvent,
+  revent:   Arc<Mutex<CudaEvent>>,
 }
 
 impl<E: Ord + Clone> TGpuEvent<E> {
@@ -146,9 +149,12 @@ impl<E: Ord + Clone> TGpuEvent<E> {
       }
     }
     #[cfg(feature = "gpu")]
-    match self.revent.record(&mut stream.rstream) {
-      Err(e) => panic!("record failed: {:?} ({})", e, e.get_string()),
-      Ok(_) => {}
+    {
+      let mut revent = self.revent.lock();
+      match revent.record(&mut stream.rstream) {
+        Err(e) => panic!("record failed: {:?} ({})", e, e.get_string()),
+        Ok(_) => {}
+      }
     }
     self.t = Some(new_t.clone());
   }
@@ -228,9 +234,12 @@ impl<E: Ord + Clone> TGpuStream<E> {
     };
     if advance {
       #[cfg(feature = "gpu")]
-      match self.rstream.wait_event(&mut ev.revent) {
-        Err(e) => panic!("wait_event failed: {:?} ({})", e, e.get_string()),
-        Ok(_) => {}
+      {
+        let mut revent = ev.revent.lock();
+        match self.rstream.wait_event(&mut revent) {
+          Err(e) => panic!("wait_event failed: {:?} ({})", e, e.get_string()),
+          Ok(_) => {}
+        }
       }
       self.t.maybe_advance(&t);
       self.horizons.insert(t.uid.clone(), t);
