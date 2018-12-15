@@ -125,7 +125,6 @@ impl PCausalOrd for LamportTime<DefaultEpoch> {
 #[derive(Clone)]
 pub struct TGpuEvent<E=DefaultEpoch> {
   dev:      i32,
-  uid:      Uid,
   t:        Option<LamportTime<E>>,
   #[cfg(feature = "gpu")]
   revent:   Arc<Mutex<CudaEvent>>,
@@ -140,8 +139,8 @@ impl<E: Ord + Clone> TGpuEvent<E> {
   }
 
   pub fn post(&mut self, new_t: LamportTime<E>, stream: &mut TGpuStream<E>) {
-    assert_eq!(self.uid, new_t.uid, "bug");
-    assert_eq!(self.uid, stream.uid, "bug");
+    assert_eq!(self.dev, stream.dev, "bug");
+    assert_eq!(new_t.uid, stream.t.uid, "bug");
     match self.t.take() {
       None => {}
       Some(_) => {
@@ -174,7 +173,6 @@ impl<E> TGpuEventPool<E> {
 
 pub struct TGpuStream<E=DefaultEpoch> {
   dev:      i32,
-  uid:      Uid,
   t:        LamportTime<E>,
   horizons: HashMap<Uid, LamportTime<E>>,
   events:   TGpuEventPool<E>,
@@ -208,7 +206,6 @@ impl<E: Ord + Clone> TGpuStream<E> {
     ev.post(self.t.clone(), self);
     TGpuThunk{
       dev:  self.dev,
-      uid:  self.uid.clone(),
       t:    self.t.clone(),
       ev,
       val,
@@ -250,7 +247,6 @@ impl<E: Ord + Clone> TGpuStream<E> {
 #[derive(Clone)]
 pub struct TGpuThunk<V=(), E=DefaultEpoch> {
   dev:  i32,
-  uid:  Uid,
   t:    LamportTime<E>,
   ev:   TGpuEvent<E>,
   //fun:  Option<Box<dyn FnOnce(&mut V, &mut TGpuStream<TT>)>>,
@@ -271,7 +267,6 @@ impl<V, E: Ord + Clone> TGpuThunk<V, E> {
     }
     TGpuThunkRef{
       dev:    self.dev,
-      uid:    self.uid,
       t:      self.t,
       ev:     self.ev,
       val:    self.val,
@@ -281,7 +276,6 @@ impl<V, E: Ord + Clone> TGpuThunk<V, E> {
 
 pub struct TGpuThunkRef<V=(), E=DefaultEpoch> {
   dev:  i32,
-  uid:  Uid,
   t:    LamportTime<E>,
   ev:   TGpuEvent<E>,
   val:  V,
