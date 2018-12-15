@@ -1,5 +1,6 @@
-#![feature(fnbox)]
 #![feature(integer_atomics)]
+#![feature(optin_builtin_traits)]
+#![feature(pin)]
 
 //extern crate cudart;
 #[macro_use] extern crate lazy_static;
@@ -8,12 +9,13 @@ extern crate parking_lot;
 //use cudart::{CudaStream, CudaEvent};
 use parking_lot::{Mutex, RwLock, MappedRwLockReadGuard, MappedRwLockWriteGuard};
 
-//use std::boxed::{FnBox};
 use std::cmp::{Ordering};
 use std::collections::{HashMap};
 use std::ops::{Deref};
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+pub mod ctx;
 
 lazy_static! {
   static ref UID_64_CTR:    AtomicU64 = AtomicU64::new(0);
@@ -72,9 +74,19 @@ impl Fresh for TotalTime<u64> {
 }
 
 pub struct TGpuEvent<TT=TotalTime> {
+  dev:      i32,
   uid:      Uid,
-  tt:       TT,
+  tt:       Option<TT>,
   //inner:    CudaEvent,
+}
+
+impl<TT: Clone> TGpuEvent<TT> {
+  pub fn total_time(&self) -> TT {
+    match self.tt {
+      None => panic!(),
+      Some(ref tt) => tt.clone(),
+    }
+  }
 }
 
 pub struct TGpuEventPool<TT=TotalTime> {
@@ -83,42 +95,81 @@ pub struct TGpuEventPool<TT=TotalTime> {
 }
 
 pub struct TGpuStream<TT=TotalTime> {
+  dev:      i32,
   uid:      Uid,
   tt:       Option<TT>,
-  links:    HashMap<Uid, TT>,
+  horizons: HashMap<Uid, TT>,
   events:   TGpuEventPool<TT>,
-  //inner:    CudaStream,
+  //stream:   CudaStream,
+}
+
+impl<TT> TGpuStream<TT> {
+  /*pub fn cuda_stream(&mut self) -> &mut CudaStream {
+    &mut self.stream
+  }*/
 }
 
 impl<TT: TotalOrd + Fresh + Clone> TGpuStream<TT> {
-  pub fn run<F, V>(&mut self, fun: F) -> TGpuThunk<V, TT> where F: FnOnce(&mut V, &mut TGpuStream<TT>) + 'static, V: Default {
+  pub fn run<F, V>(&mut self, fun: F) -> TGpuThunk<V, TT>
+  where F: FnOnce(&mut V, &mut TGpuStream<TT>) + 'static, V: Default {
     // TODO
-    //let boxed_fun = Box::new(fun);
+    //let mut ev = self.events.make(self.uid.clone());
+    let mut val = V::default();
+    (fun)(&mut val, self);
     let new_tt = TT::fresh();
+    //ev.post(new_tt, &mut self.stream);
     self.tt = Some(new_tt.clone());
-    let mut new_thk = TGpuThunk{
+    TGpuThunk{
+      dev:  self.dev,
       uid:  self.uid.clone(),
       tt:   new_tt,
-      //fun:  Some(boxed_fun),
-      fun:  None,
-      val:  V::default(),
-    };
-    //new_thk.force(self);
-    (fun)(&mut new_thk.val, self);
-    new_thk
+      // TODO
+      //ev:   _,
+      val,
+    }
   }
 
   pub fn maybe_wait_for(&mut self, ev: &mut TGpuEvent<TT>) {
+    let ett = ev.total_time();
+    let pushback = match self.horizons.get(&ev.uid).map(|tt| tt.clone()) {
+      None => true,
+      Some(htt) => match htt.total_cmp(&ett) {
+        TotalOrdering::Before => true,
+        TotalOrdering::Equal |
+        TotalOrdering::After => false,
+      },
+    };
+    if pushback {
+      // TODO
+      /*match self.stream.wait_event(&mut ev.event) {
+        Err(e) => panic!("wait_event failed: {:?} ({})", e, e.get_string()),
+        Ok(_) => {}
+      }*/
+      self.horizons.insert(ev.uid.clone(), ett);
+    }
   }
 }
 
 pub struct TGpuThunk<V, TT=TotalTime> {
+  dev:  i32,
   uid:  Uid,
   tt:   TT,
   // TODO
   //ev:   TGpuEvent<TT>,
-  fun:  Option<Box<dyn FnOnce(&mut V, &mut TGpuStream<TT>)>>,
+  //fun:  Option<Box<dyn FnOnce(&mut V, &mut TGpuStream<TT>)>>,
   val:  V,
+}
+
+impl<V: Clone, TT: Clone> Clone for TGpuThunk<V, TT> {
+  fn clone(&self) -> TGpuThunk<V, TT> {
+    TGpuThunk{
+      dev:  self.dev,
+      uid:  self.uid.clone(),
+      tt:   self.tt.clone(),
+      //ev:   self.ev.clone(),
+      val:  self.val.clone(),
+    }
+  }
 }
 
 impl<V, TT: TotalOrd> TGpuThunk<V, TT> {
@@ -129,6 +180,7 @@ impl<V, TT: TotalOrd> TGpuThunk<V, TT> {
           TotalOrdering::Equal |
           TotalOrdering::Before => {
             TGpuThunkRef{
+              dev:    self.dev,
               uid:    self.uid,
               tt:     self.tt,
               //ev:     self.ev,
@@ -153,6 +205,7 @@ impl<V, TT: TotalOrd> TGpuThunk<V, TT> {
             unimplemented!();
             /*tstream.maybe_wait_for(&mut self.ev);
             TGpuThunkRef{
+              dev:    self.dev,
               uid:    self.uid,
               tt:     self.tt,
               //ev:     self.ev,
@@ -176,6 +229,7 @@ impl<V, TT: TotalOrd> TGpuThunk<V, TT> {
 }
 
 pub struct TGpuThunkRef<V, TT=TotalTime> {
+  dev:  i32,
   uid:  Uid,
   tt:   TT,
   // TODO
