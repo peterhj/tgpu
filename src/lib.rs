@@ -77,15 +77,42 @@ pub struct TGpuEvent<TT=TotalTime> {
   dev:      i32,
   uid:      Uid,
   tt:       Option<TT>,
-  //inner:    CudaEvent,
+  //event:    CudaEvent,
 }
 
-impl<TT: Clone> TGpuEvent<TT> {
+impl<TT: TotalOrd + Clone> TGpuEvent<TT> {
   pub fn total_time(&self) -> TT {
     match self.tt {
       None => panic!(),
       Some(ref tt) => tt.clone(),
     }
+  }
+
+  pub fn post(&mut self, new_tt: TT, tstream: &mut TGpuStream<TT>) {
+    assert_eq!(self.uid, tstream.uid, "bug");
+    match self.tt.take() {
+      None => {}
+      Some(_) => {
+        panic!("bug: double post");
+      }
+    }
+    match tstream.tt.take() {
+      None => {}
+      Some(tstream_tt) => {
+        match tstream_tt.total_cmp(&new_tt) {
+          TotalOrdering::Equal |
+          TotalOrdering::After => {
+            panic!("causal violation");
+          }
+          TotalOrdering::Before => {}
+        }
+      }
+    }
+    /*match self.event.record(tstream.cuda_stream()) {
+      // TODO
+    }*/
+    self.tt = Some(new_tt.clone());
+    tstream.tt = Some(new_tt);
   }
 }
 
@@ -131,7 +158,7 @@ impl<TT: TotalOrd + Fresh + Clone> TGpuStream<TT> {
 
   pub fn maybe_wait_for(&mut self, ev: &mut TGpuEvent<TT>) {
     let ett = ev.total_time();
-    let pushback = match self.horizons.get(&ev.uid).map(|tt| tt.clone()) {
+    let advance = match self.horizons.get(&ev.uid).map(|tt| tt.clone()) {
       None => true,
       Some(htt) => match htt.total_cmp(&ett) {
         TotalOrdering::Before => true,
@@ -139,7 +166,7 @@ impl<TT: TotalOrd + Fresh + Clone> TGpuStream<TT> {
         TotalOrdering::After => false,
       },
     };
-    if pushback {
+    if advance {
       // TODO
       /*match self.stream.wait_event(&mut ev.event) {
         Err(e) => panic!("wait_event failed: {:?} ({})", e, e.get_string()),
@@ -188,7 +215,7 @@ impl<V, TT: TotalOrd> TGpuThunk<V, TT> {
             }
           }
           TotalOrdering::After => {
-            panic!("probable causal violation (one stream)");
+            panic!("causal violation (one stream)");
           }
         }
       } else {
@@ -213,7 +240,7 @@ impl<V, TT: TotalOrd> TGpuThunk<V, TT> {
             }*/
           }
           TotalOrdering::After => {
-            panic!("probable causal violation (two streams)");
+            panic!("causal violation (two streams)");
           }
         }
       } else {
