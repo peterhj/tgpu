@@ -1,0 +1,14 @@
+[package]
+name = "tgpu"
+version = "0.0.0"
+authors = ["Peter Jin <peterhaijin@gmail.com>"]
+edition = "2018"
+
+[lib]
+name = "tgpu"
+path = "src/lib.rs"
+
+[dependencies]
+#cudart = { git = "https://github.com/peterhj/cudart" }
+lazy_static = "*"
+parking_lot = { version = "*", features = ["nightly", "deadlock_detection"] }
