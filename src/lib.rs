@@ -4,12 +4,12 @@
 #![feature(specialization)]
 
 extern crate cudart;
+extern crate gpurepr;
 #[macro_use] extern crate lazy_static;
 extern crate parking_lot;
 
-use crate::ctx::{GpuCtxGuard};
-
 use cudart::{CudaStream, CudaEvent, CudaEventStatus};
+use gpurepr::ctx::{GpuCtxGuard};
 use parking_lot::{Mutex};
 
 use std::cmp::{Ordering, max};
@@ -18,8 +18,6 @@ use std::marker::{PhantomData};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-
-pub mod ctx;
 
 lazy_static! {
   static ref UID64_CTR: AtomicU64 = AtomicU64::new(0);
@@ -156,6 +154,12 @@ pub struct TGpuStream<E=DefaultEpoch> {
   rstream:  CudaStream,
 }
 
+impl Default for TGpuStream {
+  fn default() -> TGpuStream {
+    TGpuStream::new(0)
+  }
+}
+
 impl<E: Ord> TGpuStream<E> {
   pub fn new(dev: i32) -> TGpuStream<E> {
     let _ctx = GpuCtxGuard::new(dev);
@@ -190,15 +194,10 @@ impl<E: Ord> TGpuStream<E> {
 }
 
 impl<E: Ord + Clone> TGpuStream<E> {
-  pub fn run<F, V>(&mut self, fun: F) -> TGpuUnsafeThunk<V, E>
-  where F: FnOnce(&mut V, TGpuStreamRef<E>) + 'static, V: Default {
-    self.wrap_run(V::default(), fun)
-  }
-
-  pub fn wrap_run<F, V>(&mut self, mut val: V, fun: F) -> TGpuUnsafeThunk<V, E>
-  where F: FnOnce(&mut V, TGpuStreamRef<E>) + 'static {
+  pub fn run<V, F>(&mut self, fun: F) -> TGpuUnsafeThunk<V, E>
+  where F: FnOnce(TGpuStreamRef<E>) -> V {
     self.t = self.fresh_time();
-    (fun)(&mut val, TGpuStreamRef{this: self});
+    let val = (fun)(TGpuStreamRef{this: self});
     let ev = self.post_event();
     TGpuUnsafeThunk{
       dev:  self.dev,
@@ -333,6 +332,7 @@ pub struct TGpuUnsafeThunkRef<'stream, V> {
   _mrk: PhantomData<&'stream ()>,
 }
 
+// TODO
 impl<'stream, V> Deref for TGpuUnsafeThunkRef<'stream, V> {
   type Target = V;
 
@@ -341,6 +341,7 @@ impl<'stream, V> Deref for TGpuUnsafeThunkRef<'stream, V> {
   }
 }
 
+// TODO
 impl<'stream, V> DerefMut for TGpuUnsafeThunkRef<'stream, V> {
   fn deref_mut(&mut self) -> &mut V {
     &mut self.val
@@ -370,6 +371,29 @@ impl<V, E: Ord + Clone> TGpuUnsafeThunk<V, E> {
       val:    self.val,
       _mrk:   PhantomData,
     }
+  }
+
+  pub fn status(&self) -> CudaEventStatus {
+    let mut revent = self.ev.revent.lock();
+    match &mut *revent {
+      &mut None => {
+        CudaEventStatus::Complete
+      }
+      &mut Some(ref mut rev) => {
+        match rev.query() {
+          Err(e) => {
+            panic!("query failed: {:?} ({})", e, e.get_string());
+          }
+          Ok(status) => {
+            status
+          }
+        }
+      }
+    }
+  }
+
+  pub fn unchecked_into(self) -> V {
+    self.val
   }
 
   pub fn wait(self) -> V {
