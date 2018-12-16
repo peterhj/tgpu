@@ -7,11 +7,15 @@ extern crate cudart;
 #[macro_use] extern crate lazy_static;
 extern crate parking_lot;
 
+use crate::ctx::{GpuCtxGuard};
+
 use cudart::{CudaStream, CudaEvent, CudaEventStatus};
 use parking_lot::{Mutex};
 
 use std::cmp::{Ordering, max};
 use std::collections::{HashMap, VecDeque};
+use std::marker::{PhantomData};
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -43,6 +47,7 @@ pub enum TotalOrdering {
 }
 
 pub trait TotalOrd {
+  fn bottom() -> Self where Self: Sized;
   fn next(&self) -> Self where Self: Sized;
   fn total_cmp(&self, other: &Self) -> TotalOrdering;
 }
@@ -53,6 +58,10 @@ pub struct TotalTime<E=DefaultEpoch> {
 }
 
 impl<E: Ord> TotalOrd for TotalTime<E> {
+  default fn bottom() -> TotalTime<E> {
+    unimplemented!();
+  }
+
   default fn next(&self) -> TotalTime<E> {
     unimplemented!();
   }
@@ -67,6 +76,10 @@ impl<E: Ord> TotalOrd for TotalTime<E> {
 }
 
 impl TotalOrd for TotalTime<DefaultEpoch> {
+  fn bottom() -> TotalTime<DefaultEpoch> {
+    TotalTime{epoch: 0}
+  }
+
   fn next(&self) -> TotalTime<DefaultEpoch> {
     let new_e = self.epoch + 1;
     assert!(new_e != 0);
@@ -144,6 +157,30 @@ pub struct TGpuStream<E=DefaultEpoch> {
 }
 
 impl<E: Ord> TGpuStream<E> {
+  pub fn new(dev: i32) -> TGpuStream<E> {
+    let _ctx = GpuCtxGuard::new(dev);
+    let rstream = match CudaStream::create() {
+      Err(e) => {
+        panic!("create stream failed: {:?} ({})", e, e.get_string());
+      }
+      Ok(rstr) => {
+        rstr
+      }
+    };
+    let t = LamportTime{
+      uid:  Uid::fresh(),
+      tt:   TotalTime::<E>::bottom(),
+    };
+    TGpuStream{
+      dev,
+      t,
+      horizons: HashMap::new(),
+      qlatest:  None,
+      queue:    VecDeque::new(),
+      rstream,
+    }
+  }
+
   fn fresh_time(&self) -> LamportTime<E> {
     LamportTime{
       uid:  self.t.uid.clone(),
@@ -153,17 +190,17 @@ impl<E: Ord> TGpuStream<E> {
 }
 
 impl<E: Ord + Clone> TGpuStream<E> {
-  pub fn run<F, V>(&mut self, fun: F) -> TGpuThunk<V, E>
+  pub fn run<F, V>(&mut self, fun: F) -> TGpuUnsafeThunk<V, E>
   where F: FnOnce(&mut V, TGpuStreamRef<E>) + 'static, V: Default {
     self.wrap_run(V::default(), fun)
   }
 
-  pub fn wrap_run<F, V>(&mut self, mut val: V, fun: F) -> TGpuThunk<V, E>
+  pub fn wrap_run<F, V>(&mut self, mut val: V, fun: F) -> TGpuUnsafeThunk<V, E>
   where F: FnOnce(&mut V, TGpuStreamRef<E>) + 'static {
     self.t = self.fresh_time();
     (fun)(&mut val, TGpuStreamRef{this: self});
     let ev = self.post_event();
-    TGpuThunk{
+    TGpuUnsafeThunk{
       dev:  self.dev,
       ev,
       val,
@@ -291,15 +328,34 @@ impl<E: Ord + Clone> TGpuStream<E> {
   }
 }
 
+pub struct TGpuUnsafeThunkRef<'stream, V> {
+  val:  V,
+  _mrk: PhantomData<&'stream ()>,
+}
+
+impl<'stream, V> Deref for TGpuUnsafeThunkRef<'stream, V> {
+  type Target = V;
+
+  fn deref(&self) -> &V {
+    &self.val
+  }
+}
+
+impl<'stream, V> DerefMut for TGpuUnsafeThunkRef<'stream, V> {
+  fn deref_mut(&mut self) -> &mut V {
+    &mut self.val
+  }
+}
+
 #[derive(Clone)]
-pub struct TGpuThunk<V=(), E=DefaultEpoch> {
+pub struct TGpuUnsafeThunk<V=(), E=DefaultEpoch> {
   dev:  i32,
   ev:   TGpuEvent<E>,
   val:  V,
 }
 
-impl<V, E: Ord + Clone> TGpuThunk<V, E> {
-  pub fn wait(mut self, stream: TGpuStreamRef<E>) -> TGpuThunkRef<V, E> {
+impl<V, E: Ord + Clone> TGpuUnsafeThunk<V, E> {
+  pub fn sync<'stream>(mut self, stream: &mut TGpuStreamRef<'stream, E>) -> TGpuUnsafeThunkRef<'stream, V> {
     match self.ev.t.causal_cmp(&stream.this.t) {
       PCausalOrdering::Before |
       PCausalOrdering::Equal => {}
@@ -310,16 +366,28 @@ impl<V, E: Ord + Clone> TGpuThunk<V, E> {
         stream.this.maybe_sync(&mut self.ev);
       }
     }
-    TGpuThunkRef{
-      dev:    self.dev,
-      ev:     self.ev,
+    TGpuUnsafeThunkRef{
       val:    self.val,
+      _mrk:   PhantomData,
     }
   }
-}
 
-pub struct TGpuThunkRef<V=(), E=DefaultEpoch> {
-  dev:  i32,
-  ev:   TGpuEvent<E>,
-  val:  V,
+  pub fn wait(self) -> V {
+    let mut revent = self.ev.revent.lock();
+    match &mut *revent {
+      &mut None => {
+        self.val
+      }
+      &mut Some(ref mut rev) => {
+        match rev.synchronize() {
+          Err(e) => {
+            panic!("synchronize failed: {:?} ({})", e, e.get_string());
+          }
+          Ok(_) => {
+            self.val
+          }
+        }
+      }
+    }
+  }
 }
