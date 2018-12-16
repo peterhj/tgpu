@@ -9,6 +9,7 @@ extern crate gpurepr;
 extern crate parking_lot;
 
 use cudart::{CudaStream, CudaEvent, CudaEventStatus};
+use gpurepr::{GpuDelay, GpuDelayed, GpuDelayedMut, GpuRegion, GpuRegionMut};
 use gpurepr::ctx::{GpuCtxGuard};
 use parking_lot::{Mutex};
 
@@ -140,6 +141,10 @@ pub struct TGpuStreamRef<'a, E=DefaultEpoch> {
 }
 
 impl<'a, E> TGpuStreamRef<'a, E> {
+  pub fn device(&mut self) -> i32 {
+    self.this.dev
+  }
+
   pub fn cuda_stream(&mut self) -> &mut CudaStream {
     &mut self.this.rstream
   }
@@ -345,6 +350,69 @@ impl<'stream, V> Deref for TGpuUnsafeThunkRef<'stream, V> {
 impl<'stream, V> DerefMut for TGpuUnsafeThunkRef<'stream, V> {
   fn deref_mut(&mut self) -> &mut V {
     &mut self.val
+  }
+}
+
+// TODO
+impl<'stream, V> GpuDelayed<V> for TGpuUnsafeThunkRef<'stream, V>
+where V: GpuDelay + GpuRegion<<V as GpuDelay>::Target> {
+  fn dptr(&self) -> *const V::Target {
+    unsafe { self.val.as_devptr() }
+  }
+}
+
+// TODO
+impl<'stream, V> GpuDelayedMut<V> for TGpuUnsafeThunkRef<'stream, V>
+where V: GpuDelay + GpuRegionMut<<V as GpuDelay>::Target> {
+  fn dptr_mut(&self) -> *mut V::Target {
+    unsafe { self.val.as_devptr_mut() }
+  }
+}
+
+pub struct TGpuThunkRef<'stream, V> {
+  val:  V,
+  _mrk: PhantomData<&'stream ()>,
+}
+
+impl<'stream, V> Deref for TGpuThunkRef<'stream, V> {
+  type Target = V;
+
+  fn deref(&self) -> &V {
+    &self.val
+  }
+}
+
+impl<'stream, V> GpuDelayed<V> for TGpuThunkRef<'stream, V>
+where V: GpuDelay + GpuRegion<<V as GpuDelay>::Target> {
+  fn dptr(&self) -> *const V::Target {
+    unsafe { self.val.as_devptr() }
+  }
+}
+
+pub struct TGpuThunkRefMut<'stream, V> {
+  val:  V,
+  _mrk: PhantomData<&'stream ()>,
+}
+
+impl<'stream, V> Deref for TGpuThunkRefMut<'stream, V> {
+  type Target = V;
+
+  fn deref(&self) -> &V {
+    &self.val
+  }
+}
+
+impl<'stream, V> GpuDelayed<V> for TGpuThunkRefMut<'stream, V>
+where V: GpuDelay + GpuRegion<<V as GpuDelay>::Target> {
+  fn dptr(&self) -> *const V::Target {
+    unsafe { self.val.as_devptr() }
+  }
+}
+
+impl<'stream, V> GpuDelayedMut<V> for TGpuThunkRefMut<'stream, V>
+where V: GpuDelay + GpuRegionMut<<V as GpuDelay>::Target> {
+  fn dptr_mut(&self) -> *mut V::Target {
+    unsafe { self.val.as_devptr_mut() }
   }
 }
 

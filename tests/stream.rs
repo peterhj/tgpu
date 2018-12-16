@@ -1,5 +1,7 @@
+extern crate gpurepr;
 extern crate tgpu;
 
+use gpurepr::*;
 use tgpu::*;
 
 #[test]
@@ -53,4 +55,19 @@ fn stream_do_stuff_2() {
   assert_eq!(1, y.wait());
   assert_eq!(2, z.wait());
   assert_eq!(3, w.wait());
+}
+
+#[test]
+fn stream_mem() {
+  let mut stream = TGpuStream::default();
+  fn do_something(x: impl GpuDelayed<GpuUnsafeMem<u32>>) {
+    // TODO
+  }
+  let x = stream.run(|ref mut stream| {
+    unsafe { GpuUnsafeMem::<u32>::alloc(1024, stream.device()) }
+  });
+  stream.run(|ref mut stream| {
+    let x = x.sync(stream);
+    do_something(x);
+  });
 }
