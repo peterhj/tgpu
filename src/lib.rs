@@ -3,20 +3,15 @@
 #![feature(pin)]
 #![feature(specialization)]
 
-#[cfg(feature = "gpu")]
 extern crate cudart;
 #[macro_use] extern crate lazy_static;
-#[cfg(feature = "gpu")]
 extern crate parking_lot;
 
-#[cfg(feature = "gpu")]
-use cudart::{CudaStream, CudaEvent};
-#[cfg(feature = "gpu")]
+use cudart::{CudaStream, CudaEvent, CudaEventStatus};
 use parking_lot::{Mutex};
 
 use std::cmp::{Ordering, max};
 use std::collections::{HashMap, VecDeque};
-#[cfg(feature = "gpu")]
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -126,7 +121,6 @@ impl PCausalOrd for LamportTime<DefaultEpoch> {
 pub struct TGpuEvent<E=DefaultEpoch> {
   dev:      i32,
   t:        LamportTime<E>,
-  #[cfg(feature = "gpu")]
   revent:   Arc<Mutex<Option<CudaEvent>>>,
 }
 
@@ -135,7 +129,6 @@ pub struct TGpuStreamRef<'a, E=DefaultEpoch> {
 }
 
 impl<'a, E> TGpuStreamRef<'a, E> {
-  #[cfg(feature = "gpu")]
   pub fn cuda_stream(&mut self) -> &mut CudaStream {
     &mut self.this.rstream
   }
@@ -147,7 +140,6 @@ pub struct TGpuStream<E=DefaultEpoch> {
   horizons: HashMap<Uid, (LamportTime<E>, LamportTime<E>)>,
   qlatest:  Option<LamportTime<E>>,
   queue:    VecDeque<TGpuEvent<E>>,
-  #[cfg(feature = "gpu")]
   rstream:  CudaStream,
 }
 
@@ -179,7 +171,6 @@ impl<E: Ord + Clone> TGpuStream<E> {
   }
 
   fn post_event(&mut self) -> TGpuEvent<E> {
-    // TODO
     match self.qlatest.take() {
       None => {}
       Some(qt) => {
@@ -195,11 +186,7 @@ impl<E: Ord + Clone> TGpuStream<E> {
         }
       }
     }
-    self.qlatest = Some(self.t.clone());
-    #[cfg(not(feature = "gpu"))]
-    unimplemented!();
-    #[cfg(feature = "gpu")]
-    let recycle: Option<()> = match self.queue.front_mut() {
+    let recycle_revent = match self.queue.front_mut() {
       None => {
         None
       }
@@ -214,7 +201,7 @@ impl<E: Ord + Clone> TGpuStream<E> {
             None
           }
           Ok(CudaEventStatus::Complete) => {
-            let mut revent = revent.take();
+            let mut revent = revent.take().unwrap();
             match revent.record(&mut self.rstream) {
               Err(e) => {
                 panic!("record failed: {:?} ({})", e, e.get_string());
@@ -226,30 +213,39 @@ impl<E: Ord + Clone> TGpuStream<E> {
         }
       }
     };
-    unimplemented!();
-    /*let new_ev = if let Some(revent) = recycle {
-      // TODO
+    let new_revent = if let Some(revent) = recycle_revent {
       match self.queue.pop_front() {
-        None => panic!("bug"),
+        None => {
+          panic!("bug");
+        }
         Some(_) => {}
       }
-      unimplemented!();
+      revent
     } else {
-      // TODO
-      unimplemented!();
-      /*#[cfg(feature = "gpu")]
-      {
-        let mut revent = new_ev.revent.lock();
-        match revent.record(&mut stream.rstream) {
-          Err(e) => {
-            panic!("record failed: {:?} ({})", e, e.get_string());
-          }
-          Ok(_) => {}
+      let mut new_revent = match CudaEvent::create_fastest() {
+        Err(e) => {
+          panic!("create event failed: {:?} ({})", e, e.get_string());
         }
-      }*/
-    };*/
-    //self.queue.push_back(new_ev.clone());
-    //new_ev
+        Ok(rev) => {
+          rev
+        }
+      };
+      match new_revent.record(&mut self.rstream) {
+        Err(e) => {
+          panic!("record failed: {:?} ({})", e, e.get_string());
+        }
+        Ok(_) => {}
+      }
+      new_revent
+    };
+    let new_ev = TGpuEvent{
+      dev:    self.dev,
+      t:      self.t.clone(),
+      revent: Arc::new(Mutex::new(Some(new_revent))),
+    };
+    self.qlatest = Some(self.t.clone());
+    self.queue.push_back(new_ev.clone());
+    new_ev
   }
 
   fn maybe_sync(&mut self, ev: &mut TGpuEvent<E>) {
@@ -281,10 +277,10 @@ impl<E: Ord + Clone> TGpuStream<E> {
       },
     };
     if do_sync {
-      #[cfg(feature = "gpu")]
       {
         let mut revent = ev.revent.lock();
-        match self.rstream.wait_event(&mut revent) {
+        assert!(revent.is_some());
+        match self.rstream.wait_event(revent.as_mut().unwrap()) {
           Err(e) => panic!("wait_event failed: {:?} ({})", e, e.get_string()),
           Ok(_) => {}
         }
