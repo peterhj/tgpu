@@ -17,4 +17,6 @@ cudart = { git = "https://github.com/peterhj/cudart" }
 gpurepr = { path = "../gpurepr" }
 #gpurepr = { git = "https://github.com/peterhj/gpurepr" }
 lazy_static = "*"
+#memrepr = { path = "../memrepr" }
+#memrepr = { git = "https://github.com/peterhj/memrepr" }
 parking_lot = { version = "^0.7", features = ["nightly", "deadlock_detection"] }
