@@ -67,7 +67,22 @@ fn stream_mem() {
     unsafe { GpuVMem::<u32>::alloc(1024, stream.device()) }
   });
   stream.run(|ref mut stream| {
-    let x = x._sync(stream);
+    let x = x.sync(stream);
     do_something(x);
+  });
+}
+
+#[test]
+fn stream_mem_2() {
+  let mut stream = TGpuStream::default();
+  fn do_something_mut(x: impl GpuDelayedMut<GpuVMem<u32>>) {
+    // TODO
+  }
+  let x = stream.run(|ref mut stream| {
+    unsafe { GpuVMem::<u32>::alloc(1024, stream.device()) }
+  });
+  stream.run(|ref mut stream| {
+    let x = x.sync_mut(stream);
+    do_something_mut(x);
   });
 }
