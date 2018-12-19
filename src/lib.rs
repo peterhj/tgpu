@@ -11,7 +11,7 @@ extern crate parking_lot;
 use cudart::{CudaStream, CudaEvent, CudaEventStatus};
 use gpurepr::{GpuDelay, GpuDelayed, GpuDelayedMut, GpuRegion, GpuRegionMut, GpuDev};
 use gpurepr::ctx::{GpuCtxGuard};
-use parking_lot::{Mutex};
+use parking_lot::{Condvar, Mutex};
 
 use std::cmp::{Ordering, max};
 use std::collections::{HashMap, VecDeque};
@@ -210,12 +210,13 @@ impl<'a, E> TGpuStreamRef<'a, E> {
 
 pub struct TGpuStream<E=DefaultEpoch> {
   dev:      GpuDev,
+  lock:     LamportTime<E>,
   t:        LamportTime<E>,
   horizons: TGpuEventHorizons<E, LamportTime<E>>,
   qlatest:  Option<LamportTime<E>>,
   evqueue:  VecDeque<TGpuEvent<E>>,
-  thsts:    Vec<Arc<Mutex<TGpuThunkState<E>>>>,
-  mthsts:   Vec<Arc<Mutex<TGpuThunkState<E>>>>,
+  thsts:    Vec<Arc<(Mutex<TGpuThunkState<E>>, Condvar)>>,
+  mthsts:   Vec<Arc<(Mutex<TGpuThunkState<E>>, Condvar)>>,
   rstream:  CudaStream,
 }
 
@@ -231,11 +232,11 @@ impl<E> TGpuStream<E> {
     assert!(self.mthsts.is_empty());
   }
 
-  fn _push_sync(&mut self, thst: Arc<Mutex<TGpuThunkState<E>>>) {
+  fn _push_sync(&mut self, thst: Arc<(Mutex<TGpuThunkState<E>>, Condvar)>) {
     self.thsts.push(thst);
   }
 
-  fn _push_sync_mut(&mut self, thst: Arc<Mutex<TGpuThunkState<E>>>) {
+  fn _push_sync_mut(&mut self, thst: Arc<(Mutex<TGpuThunkState<E>>, Condvar)>) {
     self.mthsts.push(thst);
   }
 
@@ -243,7 +244,7 @@ impl<E> TGpuStream<E> {
   }
 }
 
-impl<E: Ord> TGpuStream<E> {
+impl<E: Ord + Clone> TGpuStream<E> {
   pub fn new(dev: GpuDev) -> TGpuStream<E> {
     let _ctx = GpuCtxGuard::new(dev);
     let rstream = match CudaStream::create() {
@@ -260,6 +261,7 @@ impl<E: Ord> TGpuStream<E> {
     };
     TGpuStream{
       dev,
+      lock:     t.clone(),
       t,
       horizons: TGpuEventHorizons::new(),
       qlatest:  None,
@@ -276,9 +278,7 @@ impl<E: Ord> TGpuStream<E> {
       tt:   self.t.tt.next(),
     }
   }
-}
 
-impl<E: Ord + Clone> TGpuStream<E> {
   fn maybe_sync(&mut self, ev: &mut TGpuEvent<E>) {
     let do_sync = self.horizons.can_update(ev.t.clone());
     if do_sync {
@@ -384,8 +384,8 @@ impl<E: Ord + Clone> TGpuStream<E> {
     };
     self.qlatest = Some(self.t.clone());
     self.evqueue.push_back(post_ev.clone());
-    for thst in self.thsts.drain(..) {
-      let mut thst = thst.lock();
+    for thst_cond in self.thsts.drain(..) {
+      let mut thst = thst_cond.0.lock();
       match thst.prop {
         Some(TGpuThunkProposal::Sync_) => {}
         _ => panic!("bug"),
@@ -394,9 +394,10 @@ impl<E: Ord + Clone> TGpuStream<E> {
         thst.luse.update_unchecked(post_ev.t.clone(), |_| post_ev.clone());
       }
       thst.prop = None;
+      thst_cond.1.notify_one();
     }
-    for thst in self.mthsts.drain(..) {
-      let mut thst = thst.lock();
+    for thst_cond in self.mthsts.drain(..) {
+      let mut thst = thst_cond.0.lock();
       match thst.prop {
         Some(TGpuThunkProposal::SyncMut) => {}
         _ => panic!("bug"),
@@ -404,6 +405,7 @@ impl<E: Ord + Clone> TGpuStream<E> {
       thst.ldef = post_ev.clone();
       thst.luse.vector.clear();
       thst.prop = None;
+      thst_cond.1.notify_one();
     }
     post_ev
   }
@@ -411,6 +413,7 @@ impl<E: Ord + Clone> TGpuStream<E> {
   pub fn run_wait<V, F>(&mut self, fun: F) -> V
   where F: FnOnce(TGpuStreamRef<E>) -> V {
     self.t = self.fresh_time();
+    self.lock = self.t.clone();
     let val = (fun)(TGpuStreamRef::new(self));
     let mut ev = self.post_event();
     let uthk = TGpuUnsafeThunk{val};
@@ -420,13 +423,15 @@ impl<E: Ord + Clone> TGpuStream<E> {
   pub fn run<V: GpuDelay, F>(&mut self, fun: F) -> TGpuThunk<V, E>
   where F: FnOnce(TGpuStreamRef<E>) -> V {
     self.t = self.fresh_time();
+    self.lock = self.t.clone();
     let val = (fun)(TGpuStreamRef::new(self));
     let ev = self.post_event();
-    let thst = Arc::new(Mutex::new(TGpuThunkState{
+    let thst = Arc::new((Mutex::new(TGpuThunkState{
+      lock: None,
       ldef: ev,
       luse: TGpuEventHorizons::new(),
       prop: None,
-    }));
+    }), Condvar::new()));
     TGpuThunk{
       dev:  self.dev,
       val,
@@ -562,6 +567,7 @@ enum TGpuThunkProposal {
 }
 
 struct TGpuThunkState<E> {
+  lock: Option<LamportTime<E>>,
   ldef: TGpuEvent<E>,
   luse: TGpuEventHorizons<E, TGpuEvent<E>>,
   prop: Option<TGpuThunkProposal>,
@@ -571,12 +577,12 @@ struct TGpuThunkState<E> {
 pub struct TGpuThunk<V=(), E=DefaultEpoch> {
   dev:  GpuDev,
   val:  V,
-  thst: Arc<Mutex<TGpuThunkState<E>>>,
+  thst: Arc<(Mutex<TGpuThunkState<E>>, Condvar)>,
 }
 
 impl<V, E: Ord + Clone> TGpuThunk<V, E> {
   pub fn _sync<'stream>(mut self, stream: &mut TGpuStreamRef<'stream, E>) -> TGpuUnsafeThunkRef<'stream, V> {
-    let mut thst = self.thst.lock();
+    let mut thst = self.thst.0.lock();
     match thst.ldef.t.causal_cmp(&stream.this.t) {
       PCausalOrdering::Before |
       PCausalOrdering::Equal => {}
@@ -594,7 +600,7 @@ impl<V, E: Ord + Clone> TGpuThunk<V, E> {
   }
 
   pub fn status(&self) -> CudaEventStatus {
-    let mut thst = self.thst.lock();
+    let mut thst = self.thst.0.lock();
     let mut revent = thst.ldef.revent.lock();
     match &mut *revent {
       &mut None => {
@@ -614,7 +620,7 @@ impl<V, E: Ord + Clone> TGpuThunk<V, E> {
   }
 
   pub fn wait(self) -> V {
-    let mut thst = self.thst.lock();
+    let mut thst = self.thst.0.lock();
     let mut revent = thst.ldef.revent.lock();
     match &mut *revent {
       &mut None => {
@@ -636,7 +642,12 @@ impl<V, E: Ord + Clone> TGpuThunk<V, E> {
 
 impl<V: GpuDelay, E: Ord + Clone> TGpuThunk<V, E> {
   pub fn sync<'stream>(mut self, stream: &mut TGpuStreamRef<'stream, E>) -> TGpuThunkRef<'stream, V> {
-    let mut thst = self.thst.lock();
+    let mut thst = self.thst.0.lock();
+    // TODO: allow multiple use-syncs in the same run.
+    while thst.lock.is_some() {
+      self.thst.1.wait(&mut thst);
+    }
+    thst.lock = Some(stream.this.lock.clone());
     match thst.prop {
       None | Some(TGpuThunkProposal::Sync_) => {}
       _ => panic!("double sync"),
@@ -660,7 +671,11 @@ impl<V: GpuDelay, E: Ord + Clone> TGpuThunk<V, E> {
   }
 
   pub fn sync_mut<'stream>(mut self, stream: &mut TGpuStreamRef<'stream, E>) -> TGpuThunkRefMut<'stream, V> {
-    let mut thst = self.thst.lock();
+    let mut thst = self.thst.0.lock();
+    while thst.lock.is_some() {
+      self.thst.1.wait(&mut thst);
+    }
+    thst.lock = Some(stream.this.lock.clone());
     match thst.prop {
       None => {}
       _ => panic!("double sync"),
