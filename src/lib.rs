@@ -136,6 +136,53 @@ pub struct TGpuEvent<E=DefaultEpoch> {
   revent:   Arc<Mutex<Option<CudaEvent>>>,
 }
 
+pub struct TGpuEventHorizons<E, X> {
+  vector:   HashMap<Uid, (LamportTime<E>, X)>,
+}
+
+impl<E, X> TGpuEventHorizons<E, X> {
+  pub fn new() -> TGpuEventHorizons<E, X> {
+    TGpuEventHorizons{vector: HashMap::new()}
+  }
+}
+
+impl<E: Ord + Clone, X> TGpuEventHorizons<E, X> {
+  pub fn can_update(&self, t: LamportTime<E>) -> bool {
+    match self.vector.get(&t.uid) {
+      None => true,
+      Some(&(ref ht, _)) => {
+        /*match vt.causal_cmp(&self.t) {
+          PCausalOrdering::Before |
+          PCausalOrdering::Equal => {}
+          PCausalOrdering::After => {
+            panic!("causal violation");
+          }
+          PCausalOrdering::MaybeConcurrent => {
+            panic!("bug");
+          }
+        }*/
+        match ht.causal_cmp(&t) {
+          PCausalOrdering::Before => {
+            true
+          }
+          PCausalOrdering::Equal |
+          PCausalOrdering::After => {
+            false
+          }
+          PCausalOrdering::MaybeConcurrent => {
+            panic!("bug");
+          }
+        }
+      }
+    }
+  }
+
+  pub fn update_unchecked<F: FnOnce(Option<X>) -> X>(&mut self, t: LamportTime<E>, fun: F) {
+    // TODO
+    self.vector.insert(t.uid.clone(), (t.clone(), (fun)(None)));
+  }
+}
+
 pub struct TGpuStreamRef<'a, E=DefaultEpoch> {
   this: &'a mut TGpuStream<E>,
 }
@@ -164,9 +211,9 @@ impl<'a, E> TGpuStreamRef<'a, E> {
 pub struct TGpuStream<E=DefaultEpoch> {
   dev:      GpuDev,
   t:        LamportTime<E>,
-  horizons: HashMap<Uid, (LamportTime<E>, LamportTime<E>)>,
+  horizons: TGpuEventHorizons<E, LamportTime<E>>,
   qlatest:  Option<LamportTime<E>>,
-  queue:    VecDeque<TGpuEvent<E>>,
+  evqueue:  VecDeque<TGpuEvent<E>>,
   thsts:    Vec<Arc<Mutex<TGpuThunkState<E>>>>,
   mthsts:   Vec<Arc<Mutex<TGpuThunkState<E>>>>,
   rstream:  CudaStream,
@@ -214,9 +261,9 @@ impl<E: Ord> TGpuStream<E> {
     TGpuStream{
       dev,
       t,
-      horizons: HashMap::new(),
+      horizons: TGpuEventHorizons::new(),
       qlatest:  None,
-      queue:    VecDeque::new(),
+      evqueue:  VecDeque::new(),
       thsts:    Vec::new(),
       mthsts:   Vec::new(),
       rstream,
@@ -232,31 +279,33 @@ impl<E: Ord> TGpuStream<E> {
 }
 
 impl<E: Ord + Clone> TGpuStream<E> {
-  pub fn run_wait<V, F>(&mut self, fun: F) -> V
-  where F: FnOnce(TGpuStreamRef<E>) -> V {
-    self.t = self.fresh_time();
-    let val = (fun)(TGpuStreamRef::new(self));
-    let mut ev = self.post_event();
-    // TODO: cleanup uses and defs.
-    let uthk = TGpuUnsafeThunk{val};
-    uthk._wait(&mut ev)
-  }
-
-  pub fn run<V: GpuDelay, F>(&mut self, fun: F) -> TGpuThunk<V, E>
-  where F: FnOnce(TGpuStreamRef<E>) -> V {
-    self.t = self.fresh_time();
-    let val = (fun)(TGpuStreamRef::new(self));
-    let ev = self.post_event();
-    // TODO: cleanup uses and defs.
-    let thst = Arc::new(Mutex::new(TGpuThunkState{
-      ldef: ev,
-      luse: None,
-      prop: None,
-    }));
-    TGpuThunk{
-      dev:  self.dev,
-      val,
-      thst,
+  fn maybe_sync(&mut self, ev: &mut TGpuEvent<E>) {
+    let do_sync = self.horizons.can_update(ev.t.clone());
+    if do_sync {
+      {
+        let mut revent = ev.revent.lock();
+        assert!(revent.is_some());
+        match self.rstream.wait_event(revent.as_mut().unwrap()) {
+          Err(e) => panic!("wait_event failed: {:?} ({})", e, e.get_string()),
+          Ok(_) => {}
+        }
+      }
+      self.t.maybe_advance(&ev.t);
+      let new_t = self.t.clone();
+      self.horizons.update_unchecked(ev.t.clone(), |_| {
+        // TODO: check invariant.
+        /*match vt.causal_cmp(&self.t) {
+          PCausalOrdering::Before |
+          PCausalOrdering::Equal => {}
+          PCausalOrdering::After => {
+            panic!("causal violation");
+          }
+          PCausalOrdering::MaybeConcurrent => {
+            panic!("bug");
+          }
+        }*/
+        new_t
+      });
     }
   }
 
@@ -276,7 +325,7 @@ impl<E: Ord + Clone> TGpuStream<E> {
         }
       }
     }
-    let recycle_revent = match self.queue.front_mut() {
+    let recycle_revent = match self.evqueue.front_mut() {
       None => {
         None
       }
@@ -304,7 +353,7 @@ impl<E: Ord + Clone> TGpuStream<E> {
       }
     };
     let new_revent = if let Some(revent) = recycle_revent {
-      match self.queue.pop_front() {
+      match self.evqueue.pop_front() {
         None => {
           panic!("bug");
         }
@@ -328,20 +377,22 @@ impl<E: Ord + Clone> TGpuStream<E> {
       }
       new_revent
     };
-    let new_ev = TGpuEvent{
+    let post_ev = TGpuEvent{
       dev:    self.dev,
       t:      self.t.clone(),
       revent: Arc::new(Mutex::new(Some(new_revent))),
     };
     self.qlatest = Some(self.t.clone());
-    self.queue.push_back(new_ev.clone());
+    self.evqueue.push_back(post_ev.clone());
     for thst in self.thsts.drain(..) {
       let mut thst = thst.lock();
       match thst.prop {
         Some(TGpuThunkProposal::Sync_) => {}
         _ => panic!("bug"),
       }
-      thst.luse = Some(new_ev.clone());
+      if thst.luse.can_update(post_ev.t.clone()) {
+        thst.luse.update_unchecked(post_ev.t.clone(), |_| post_ev.clone());
+      }
       thst.prop = None;
     }
     for thst in self.mthsts.drain(..) {
@@ -350,52 +401,36 @@ impl<E: Ord + Clone> TGpuStream<E> {
         Some(TGpuThunkProposal::SyncMut) => {}
         _ => panic!("bug"),
       }
-      thst.ldef = new_ev.clone();
-      thst.luse = None;
+      thst.ldef = post_ev.clone();
+      thst.luse.vector.clear();
       thst.prop = None;
     }
-    new_ev
+    post_ev
   }
 
-  fn maybe_sync(&mut self, ev: &mut TGpuEvent<E>) {
-    let do_sync = match self.horizons.get(&ev.t.uid) {
-      None => true,
-      Some(&(ref ht, ref vt)) => {
-        match vt.causal_cmp(&self.t) {
-          PCausalOrdering::Before |
-          PCausalOrdering::Equal => {}
-          PCausalOrdering::After => {
-            panic!("causal violation");
-          }
-          PCausalOrdering::MaybeConcurrent => {
-            panic!("bug");
-          }
-        }
-        match ht.causal_cmp(&ev.t) {
-          PCausalOrdering::Before => {
-            true
-          }
-          PCausalOrdering::Equal |
-          PCausalOrdering::After => {
-            false
-          }
-          PCausalOrdering::MaybeConcurrent => {
-            panic!("bug");
-          }
-        }
-      },
-    };
-    if do_sync {
-      {
-        let mut revent = ev.revent.lock();
-        assert!(revent.is_some());
-        match self.rstream.wait_event(revent.as_mut().unwrap()) {
-          Err(e) => panic!("wait_event failed: {:?} ({})", e, e.get_string()),
-          Ok(_) => {}
-        }
-      }
-      self.t.maybe_advance(&ev.t);
-      self.horizons.insert(ev.t.uid.clone(), (ev.t.clone(), self.t.clone()));
+  pub fn run_wait<V, F>(&mut self, fun: F) -> V
+  where F: FnOnce(TGpuStreamRef<E>) -> V {
+    self.t = self.fresh_time();
+    let val = (fun)(TGpuStreamRef::new(self));
+    let mut ev = self.post_event();
+    let uthk = TGpuUnsafeThunk{val};
+    uthk._wait(&mut ev)
+  }
+
+  pub fn run<V: GpuDelay, F>(&mut self, fun: F) -> TGpuThunk<V, E>
+  where F: FnOnce(TGpuStreamRef<E>) -> V {
+    self.t = self.fresh_time();
+    let val = (fun)(TGpuStreamRef::new(self));
+    let ev = self.post_event();
+    let thst = Arc::new(Mutex::new(TGpuThunkState{
+      ldef: ev,
+      luse: TGpuEventHorizons::new(),
+      prop: None,
+    }));
+    TGpuThunk{
+      dev:  self.dev,
+      val,
+      thst,
     }
   }
 }
@@ -522,14 +557,13 @@ impl<V> TGpuUnsafeThunk<V> {
 }
 
 enum TGpuThunkProposal {
-  UnsafeSync,
   Sync_,
   SyncMut,
 }
 
 struct TGpuThunkState<E> {
   ldef: TGpuEvent<E>,
-  luse: Option<TGpuEvent<E>>,
+  luse: TGpuEventHorizons<E, TGpuEvent<E>>,
   prop: Option<TGpuThunkProposal>,
 }
 
@@ -627,29 +661,31 @@ impl<V: GpuDelay, E: Ord + Clone> TGpuThunk<V, E> {
 
   pub fn sync_mut<'stream>(mut self, stream: &mut TGpuStreamRef<'stream, E>) -> TGpuThunkRefMut<'stream, V> {
     let mut thst = self.thst.lock();
-    assert!(thst.prop.is_none(), "double sync");
+    match thst.prop {
+      None => {}
+      _ => panic!("double sync"),
+    }
     thst.prop = Some(TGpuThunkProposal::SyncMut);
-    if let Some(ref mut luse) = thst.luse {
-      match luse.t.causal_cmp(&stream.this.t) {
+    for (_, (_, ref mut luse_ev)) in thst.luse.vector.iter_mut() {
+      match luse_ev.t.causal_cmp(&stream.this.t) {
         PCausalOrdering::Before |
         PCausalOrdering::Equal => {}
         PCausalOrdering::After => {
           panic!("causal violation");
         }
         PCausalOrdering::MaybeConcurrent => {
-          stream.this.maybe_sync(luse);
+          stream.this.maybe_sync(luse_ev);
         }
       }
-    } else {
-      match thst.ldef.t.causal_cmp(&stream.this.t) {
-        PCausalOrdering::Before |
-        PCausalOrdering::Equal => {}
-        PCausalOrdering::After => {
-          panic!("causal violation");
-        }
-        PCausalOrdering::MaybeConcurrent => {
-          stream.this.maybe_sync(&mut thst.ldef);
-        }
+    }
+    match thst.ldef.t.causal_cmp(&stream.this.t) {
+      PCausalOrdering::Before |
+      PCausalOrdering::Equal => {}
+      PCausalOrdering::After => {
+        panic!("causal violation");
+      }
+      PCausalOrdering::MaybeConcurrent => {
+        stream.this.maybe_sync(&mut thst.ldef);
       }
     }
     stream.this._push_sync_mut(self.thst.clone());
