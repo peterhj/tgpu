@@ -51,7 +51,7 @@ pub trait TotalOrd {
   fn total_cmp(&self, other: &Self) -> TotalOrdering;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TotalTime<E=DefaultEpoch> {
   epoch:    E,
 }
@@ -99,7 +99,7 @@ pub trait PCausalOrd {
   fn causal_cmp(&self, other: &Self) -> PCausalOrdering;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct LamportTime<E=DefaultEpoch> {
   uid:  Uid,
   tt:   TotalTime<E>,
@@ -235,7 +235,7 @@ impl<E> TGpuStream<E> {
   }
 }
 
-impl<E: Ord + Clone> TGpuStream<E> {
+impl<E: Ord + Eq + Clone> TGpuStream<E> {
   pub fn new(dev: GpuDev) -> TGpuStream<E> {
     let _ctx = GpuCtxGuard::new(dev);
     let rstream = match CudaStream::create() {
@@ -378,7 +378,7 @@ impl<E: Ord + Clone> TGpuStream<E> {
     for thst_cond in self.thsts.drain(..) {
       {
         let mut thst = thst_cond.0.lock();
-        if !(thst.lock.is_some() && thst.lock == self.lock) {
+        if !(thst.lock.is_some() && thst.lock == Some(self.lock.clone())) {
           panic!("bug");
         }
         match thst.prop {
@@ -395,7 +395,7 @@ impl<E: Ord + Clone> TGpuStream<E> {
     for thst in self.mthsts.drain(..) {
       {
         let mut thst = thst.0.lock();
-        if !(thst.lock.is_some() && thst.lock == self.lock) {
+        if !(thst.lock.is_some() && thst.lock == Some(self.lock.clone())) {
           panic!("bug");
         }
         match thst.prop {
@@ -641,23 +641,23 @@ impl<V, E: Ord + Clone> TGpuThunk<V, E> {
   }
 }
 
-impl<V: GpuDelay, E: Ord + Clone> TGpuThunk<V, E> {
-  pub fn sync<'stream>(mut self, stream: &mut TGpuStreamRef<'stream, E>) -> TGpuThunkRef<'stream, V> {
+impl<V: GpuDelay, E: Ord + Eq + Clone> TGpuThunk<V, E> {
+  pub fn sync<'stream>(self, stream: &mut TGpuStreamRef<'stream, E>) -> TGpuThunkRef<'stream, V> {
     let mut thst = self.thst.0.lock();
     loop {
-      match (thst.lock, thst.prop) {
-        (None, None) => {
+      match (&thst.lock, &thst.prop) {
+        (&None, &None) => {
           thst.lock = Some(stream.this.lock.clone());
           thst.prop = Some(TGpuThunkProposal::Sync_);
           break;
         }
-        (Some(lock), Some(prop)) => {
-          if lock == stream.this.lock {
+        (&Some(ref lock), &Some(ref prop)) => {
+          if *lock == stream.this.lock {
             match prop {
-              TGpuThunkProposal::Sync_ => {
+              &TGpuThunkProposal::Sync_ => {
                 break;
               }
-              TGpuThunkProposal::SyncMut => {
+              &TGpuThunkProposal::SyncMut => {
                 panic!("double sync");
               }
             }
@@ -685,17 +685,17 @@ impl<V: GpuDelay, E: Ord + Clone> TGpuThunk<V, E> {
     }
   }
 
-  pub fn sync_mut<'stream>(mut self, stream: &mut TGpuStreamRef<'stream, E>) -> TGpuThunkRefMut<'stream, V> {
+  pub fn sync_mut<'stream>(self, stream: &mut TGpuStreamRef<'stream, E>) -> TGpuThunkRefMut<'stream, V> {
     let mut thst = self.thst.0.lock();
     loop {
-      match (thst.lock, thst.prop) {
-        (None, None) => {
+      match (&thst.lock, &thst.prop) {
+        (&None, &None) => {
           thst.lock = Some(stream.this.lock.clone());
           thst.prop = Some(TGpuThunkProposal::SyncMut);
           break;
         }
-        (Some(lock), Some(_)) => {
-          if lock == stream.this.lock {
+        (&Some(ref lock), &Some(_)) => {
+          if *lock == stream.this.lock {
             panic!("double sync");
           } else {
             self.thst.1.wait(&mut thst);
