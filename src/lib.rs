@@ -95,7 +95,7 @@ pub enum PCausalOrdering {
 }
 
 pub trait PCausalOrd {
-  fn maybe_advance(&mut self, other: &Self);
+  fn advance(&mut self, other: &Self);
   fn causal_cmp(&self, other: &Self) -> PCausalOrdering;
 }
 
@@ -106,7 +106,7 @@ pub struct LamportTime<E=DefaultEpoch> {
 }
 
 impl<E: Ord> PCausalOrd for LamportTime<E> {
-  default fn maybe_advance(&mut self, _other: &LamportTime<E>) {
+  default fn advance(&mut self, _other: &LamportTime<E>) {
     unimplemented!();
   }
 
@@ -124,8 +124,8 @@ impl<E: Ord> PCausalOrd for LamportTime<E> {
 }
 
 impl PCausalOrd for LamportTime<DefaultEpoch> {
-  fn maybe_advance(&mut self, other: &LamportTime<DefaultEpoch>) {
-    self.tt.epoch = max(self.tt.epoch, other.tt.next().epoch);
+  fn advance(&mut self, other: &LamportTime<DefaultEpoch>) {
+    self.tt.epoch = max(self.tt.next().epoch, other.tt.next().epoch);
   }
 }
 
@@ -207,8 +207,8 @@ pub struct TGpuStream<E=DefaultEpoch> {
   lock:     LamportTime<E>,
   t:        LamportTime<E>,
   horizons: TGpuEventHorizons<E, LamportTime<E>>,
-  qlatest:  Option<LamportTime<E>>,
-  evqueue:  VecDeque<TGpuEvent<E>>,
+  //qlatest:  Option<LamportTime<E>>,
+  //evqueue:  VecDeque<TGpuEvent<E>>,
   thsts:    Vec<Arc<(Mutex<TGpuThunkState<E>>, Condvar)>>,
   mthsts:   Vec<Arc<(Mutex<TGpuThunkState<E>>, Condvar)>>,
   rstream:  CudaStream,
@@ -255,8 +255,8 @@ impl<E: Ord + Eq + Clone> TGpuStream<E> {
       lock:     t.clone(),
       t,
       horizons: TGpuEventHorizons::new(),
-      qlatest:  None,
-      evqueue:  VecDeque::new(),
+      //qlatest:  None,
+      //evqueue:  VecDeque::new(),
       thsts:    Vec::new(),
       mthsts:   Vec::new(),
       rstream,
@@ -281,7 +281,7 @@ impl<E: Ord + Eq + Clone> TGpuStream<E> {
           Ok(_) => {}
         }
       }
-      self.t.maybe_advance(&ev.t);
+      self.t.advance(&ev.t);
       let new_t = self.t.clone();
       self.horizons.update_unchecked(ev.t.clone(), |_| {
         // TODO: check invariant.
@@ -300,7 +300,7 @@ impl<E: Ord + Eq + Clone> TGpuStream<E> {
     }
   }
 
-  fn post_event(&mut self) -> TGpuEvent<E> {
+  /*fn recycle_event(&mut self) -> CudaEvent {
     match self.qlatest.take() {
       None => {}
       Some(qt) => {
@@ -367,14 +367,32 @@ impl<E: Ord + Eq + Clone> TGpuStream<E> {
         Ok(_) => {}
       }
       new_revent
+    }
+    new_revent
+  }*/
+
+  fn post_event(&mut self) -> TGpuEvent<E> {
+    let mut new_revent = match CudaEvent::create_fastest() {
+      Err(e) => {
+        panic!("create event failed: {:?} ({})", e, e.get_string());
+      }
+      Ok(rev) => {
+        rev
+      }
     };
+    match new_revent.record(&mut self.rstream) {
+      Err(e) => {
+        panic!("record failed: {:?} ({})", e, e.get_string());
+      }
+      Ok(_) => {}
+    }
     let post_ev = TGpuEvent{
       dev:    self.dev,
       t:      self.t.clone(),
       revent: Arc::new(Mutex::new(Some(new_revent))),
     };
-    self.qlatest = Some(self.t.clone());
-    self.evqueue.push_back(post_ev.clone());
+    //self.qlatest = Some(self.t.clone());
+    //self.evqueue.push_back(post_ev.clone());
     for thst_cond in self.thsts.drain(..) {
       {
         let mut thst = thst_cond.0.lock();
@@ -388,7 +406,10 @@ impl<E: Ord + Eq + Clone> TGpuStream<E> {
         if thst.luse.can_update(post_ev.t.clone()) {
           thst.luse.update_unchecked(post_ev.t.clone(), |_| post_ev.clone());
         }
+        // TODO
+        thst.lock = None;
         thst.prop = None;
+        //thst.prop = Some(TGpuThunkProposal::Done);
       }
       thst_cond.1.notify_all();
     }
@@ -404,7 +425,10 @@ impl<E: Ord + Eq + Clone> TGpuStream<E> {
         }
         thst.ldef = post_ev.clone();
         thst.luse.vector.clear();
+        // TODO
+        thst.lock = None;
         thst.prop = None;
+        //thst.prop = Some(TGpuThunkProposal::Done);
       }
       thst.1.notify_all();
     }
@@ -464,22 +488,24 @@ impl<'stream, V> DerefMut for TGpuUnsafeThunkRef<'stream, V> {
 
 // TODO
 impl<'stream, V> GpuDelayed<V> for TGpuUnsafeThunkRef<'stream, V>
-where V: GpuDelay + GpuRegion<<V as GpuDelay>::Data> {
+//where V: GpuDelay + GpuRegion<<V as GpuDelay>::Data> {
+where V: GpuDelay {
   fn domain(&self) -> GpuDom {
     GpuDom::Dev(self.val.device())
   }
 
-  fn delayed_ptr(&self) -> *const <V as GpuDelay>::Data {
+  /*fn delayed_ptr(&self) -> *const <V as GpuDelay>::Data {
     self.val.as_devptr()
-  }
+  }*/
 }
 
 // TODO
 impl<'stream, V> GpuDelayedMut<V> for TGpuUnsafeThunkRef<'stream, V>
-where V: GpuDelay + GpuRegionMut<<V as GpuDelay>::Data> {
-  fn delayed_ptr_mut(&self) -> *mut <V as GpuDelay>::Data {
+//where V: GpuDelay + GpuRegionMut<<V as GpuDelay>::Data> {
+where V: GpuDelay {
+  /*fn delayed_ptr_mut(&self) -> *mut <V as GpuDelay>::Data {
     self.val.as_devptr_mut()
-  }
+  }*/
 }
 
 pub struct TGpuThunkRef<'stream, V> {
@@ -496,14 +522,15 @@ impl<'stream, V> Deref for TGpuThunkRef<'stream, V> {
 }
 
 impl<'stream, V> GpuDelayed<V> for TGpuThunkRef<'stream, V>
-where V: GpuDelay + GpuRegion<<V as GpuDelay>::Data> {
+//where V: GpuDelay + GpuRegion<<V as GpuDelay>::Data> {
+where V: GpuDelay {
   fn domain(&self) -> GpuDom {
     GpuDom::Dev(self.val.device())
   }
 
-  fn delayed_ptr(&self) -> *const <V as GpuDelay>::Data {
+  /*fn delayed_ptr(&self) -> *const <V as GpuDelay>::Data {
     self.val.as_devptr()
-  }
+  }*/
 }
 
 pub struct TGpuThunkRefMut<'stream, V> {
@@ -520,21 +547,23 @@ impl<'stream, V> Deref for TGpuThunkRefMut<'stream, V> {
 }
 
 impl<'stream, V> GpuDelayed<V> for TGpuThunkRefMut<'stream, V>
-where V: GpuDelay + GpuRegion<<V as GpuDelay>::Data> {
+//where V: GpuDelay + GpuRegion<<V as GpuDelay>::Data> {
+where V: GpuDelay {
   fn domain(&self) -> GpuDom {
     GpuDom::Dev(self.val.device())
   }
 
-  fn delayed_ptr(&self) -> *const <V as GpuDelay>::Data {
+  /*fn delayed_ptr(&self) -> *const <V as GpuDelay>::Data {
     self.val.as_devptr()
-  }
+  }*/
 }
 
 impl<'stream, V> GpuDelayedMut<V> for TGpuThunkRefMut<'stream, V>
-where V: GpuDelay + GpuRegionMut<<V as GpuDelay>::Data> {
-  fn delayed_ptr_mut(&self) -> *mut <V as GpuDelay>::Data {
+//where V: GpuDelay + GpuRegionMut<<V as GpuDelay>::Data> {
+where V: GpuDelay {
+  /*fn delayed_ptr_mut(&self) -> *mut <V as GpuDelay>::Data {
     self.val.as_devptr_mut()
-  }
+  }*/
 }
 
 pub struct TGpuUnsafeThunk<V> {
@@ -565,6 +594,7 @@ impl<V> TGpuUnsafeThunk<V> {
 enum TGpuThunkProposal {
   Sync_,
   SyncMut,
+  //Done,
 }
 
 struct TGpuThunkState<E> {
