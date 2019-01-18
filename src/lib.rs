@@ -451,6 +451,7 @@ impl<E: Ord + Eq + Clone> TGpuStream<E> {
     self.lock = self.t.clone();
     let val = (fun)(TGpuStreamRef::new(self));
     let ev = self.post_event();
+    let def_t = ev.t.clone();
     let thst = Arc::new((Mutex::new(TGpuThunkState{
       lock: None,
       prop: None,
@@ -460,6 +461,7 @@ impl<E: Ord + Eq + Clone> TGpuStream<E> {
     TGpuThunk{
       dev:  self.dev,
       val,
+      def:  def_t,
       thst,
     }
   }
@@ -490,9 +492,9 @@ impl<'stream, V> DerefMut for TGpuUnsafeThunkRef<'stream, V> {
 impl<'stream, V> GpuDelayed<V> for TGpuUnsafeThunkRef<'stream, V>
 //where V: GpuDelay + GpuRegion<<V as GpuDelay>::Data> {
 where V: GpuDelay {
-  fn domain(&self) -> GpuDom {
+  /*fn domain(&self) -> GpuDom {
     GpuDom::Dev(self.val.device())
-  }
+  }*/
 
   /*fn delayed_ptr(&self) -> *const <V as GpuDelay>::Data {
     self.val.as_devptr()
@@ -524,9 +526,9 @@ impl<'stream, V> Deref for TGpuThunkRef<'stream, V> {
 impl<'stream, V> GpuDelayed<V> for TGpuThunkRef<'stream, V>
 //where V: GpuDelay + GpuRegion<<V as GpuDelay>::Data> {
 where V: GpuDelay {
-  fn domain(&self) -> GpuDom {
+  /*fn domain(&self) -> GpuDom {
     GpuDom::Dev(self.val.device())
-  }
+  }*/
 
   /*fn delayed_ptr(&self) -> *const <V as GpuDelay>::Data {
     self.val.as_devptr()
@@ -549,9 +551,9 @@ impl<'stream, V> Deref for TGpuThunkRefMut<'stream, V> {
 impl<'stream, V> GpuDelayed<V> for TGpuThunkRefMut<'stream, V>
 //where V: GpuDelay + GpuRegion<<V as GpuDelay>::Data> {
 where V: GpuDelay {
-  fn domain(&self) -> GpuDom {
+  /*fn domain(&self) -> GpuDom {
     GpuDom::Dev(self.val.device())
-  }
+  }*/
 
   /*fn delayed_ptr(&self) -> *const <V as GpuDelay>::Data {
     self.val.as_devptr()
@@ -608,6 +610,7 @@ struct TGpuThunkState<E> {
 pub struct TGpuThunk<V=(), E=DefaultEpoch> {
   dev:  GpuDev,
   val:  V,
+  def:  LamportTime<E>,
   thst: Arc<(Mutex<TGpuThunkState<E>>, Condvar)>,
 }
 
